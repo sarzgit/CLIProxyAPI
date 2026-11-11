@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -291,22 +292,40 @@ func decodeQuotaHistoryFile(data []byte) (quotaHistoryFile, error) {
 	return file, decodeErr
 }
 
-// mergeQuotaHistorySamples combines two sorted sample lists, keeping one
-// sample per timestamp (the newer list wins).
+// mergeQuotaHistorySamples preserves the order of distinct same-second readings.
+// Stored readings precede pending readings; an overlapping suffix/prefix is
+// included once so loading already merged history remains idempotent.
 func mergeQuotaHistorySamples(older, newer []QuotaHistorySample) []QuotaHistorySample {
 	merged := make([]QuotaHistorySample, 0, len(older)+len(newer))
-	merged = append(merged, older...)
-	merged = append(merged, newer...)
-	sort.SliceStable(merged, func(i, j int) bool { return merged[i].T < merged[j].T })
-	out := merged[:0]
-	for _, sample := range merged {
-		if n := len(out); n > 0 && out[n-1].T == sample.T {
-			out[n-1] = sample
-			continue
+	for len(older) > 0 && len(newer) > 0 {
+		switch {
+		case older[0].T < newer[0].T:
+			merged = append(merged, older[0])
+			older = older[1:]
+		case newer[0].T < older[0].T:
+			merged = append(merged, newer[0])
+			newer = newer[1:]
+		default:
+			timestamp := older[0].T
+			oldEnd, newEnd := 0, 0
+			for oldEnd < len(older) && older[oldEnd].T == timestamp {
+				oldEnd++
+			}
+			for newEnd < len(newer) && newer[newEnd].T == timestamp {
+				newEnd++
+			}
+			previous, pending := older[:oldEnd], newer[:newEnd]
+			overlap := min(len(previous), len(pending))
+			for overlap > 0 && !slices.Equal(previous[len(previous)-overlap:], pending[:overlap]) {
+				overlap--
+			}
+			merged = append(merged, previous...)
+			merged = append(merged, pending[overlap:]...)
+			older, newer = older[oldEnd:], newer[newEnd:]
 		}
-		out = append(out, sample)
 	}
-	return out
+	merged = append(merged, older...)
+	return append(merged, newer...)
 }
 
 // Observe parses the auth's latest quota observation and queues it for the

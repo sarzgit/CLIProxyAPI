@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -481,7 +482,7 @@ func TestQuotaHistoryRecoveryMergesPendingSamples(t *testing.T) {
 	}
 	file := readPersistedQuotaHistory(t, path)
 	samples := file.Accounts["same"].Samples
-	if len(file.Accounts) != 2 || len(samples) != 2 || samples[0].RemainingPercent != 90 || samples[1].RemainingPercent != 80 {
+	if len(file.Accounts) != 2 || len(samples) != 3 || samples[0].RemainingPercent != 90 || samples[1].RemainingPercent != 30 || samples[2].RemainingPercent != 80 {
 		t.Fatalf("recovered file=%+v same samples=%+v", file.Accounts, samples)
 	}
 }
@@ -689,5 +690,62 @@ func TestQuotaHistoryCloseWithConcurrentProducer(t *testing.T) {
 	}
 	if file := readPersistedQuotaHistory(t, r.path); file.Accounts["0"] == nil {
 		t.Fatal("shutdown lost an accepted observation")
+	}
+}
+
+func TestReviewR5RecoveryPreservesSameSecondDrops(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	path := filepath.Join(t.TempDir(), QuotaHistoryFileName)
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r := newTestQuotaHistoryRecorder(path, &now)
+	if err := r.Load(); err == nil {
+		t.Fatal("expected initial read failure")
+	}
+	for _, used := range []string{"0.5", "0.6", "0"} {
+		r.Observe(quotaHistoryAuth("same", "claude", now, map[string]string{"Anthropic-Ratelimit-Unified-7d-Utilization": used}))
+	}
+	r.Drain()
+	if got := len(r.History(time.Unix(0, 0))["same"].Samples); got != 3 {
+		t.Fatalf("pre-recovery samples=%d", got)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeQuotaHistoryFile(path, quotaHistoryFile{Version: 1, Accounts: map[string]*QuotaHistoryEntry{
+		"same": {Provider: "claude", WindowMinutes: 10080, Samples: []QuotaHistorySample{{T: now.Add(-time.Hour).Unix(), RemainingPercent: 60}}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	samples := readPersistedQuotaHistory(t, path).Accounts["same"].Samples
+	t.Logf("recovered samples: %+v", samples)
+	if len(samples) != 4 {
+		t.Fatalf("recovery discarded distinct observations: got %d samples, want 4", len(samples))
+	}
+}
+
+func TestQuotaHistoryMergePreservesSameSecondOrderAndOverlap(t *testing.T) {
+	a := QuotaHistorySample{T: 100, RemainingPercent: 60}
+	b := QuotaHistorySample{T: 100, RemainingPercent: 50}
+	c := QuotaHistorySample{T: 100, RemainingPercent: 100}
+	d := QuotaHistorySample{T: 101, RemainingPercent: 90}
+	for _, tc := range []struct {
+		name               string
+		older, newer, want []QuotaHistorySample
+	}{
+		{"distinct", []QuotaHistorySample{a}, []QuotaHistorySample{b, c}, []QuotaHistorySample{a, b, c}},
+		{"repeated load", []QuotaHistorySample{a, b, c}, []QuotaHistorySample{a, b, c, d}, []QuotaHistorySample{a, b, c, d}},
+		{"boundary overlap", []QuotaHistorySample{a, b}, []QuotaHistorySample{b, c, d}, []QuotaHistorySample{a, b, c, d}},
+		{"repeated value after reset", []QuotaHistorySample{a, b}, []QuotaHistorySample{c, b, d}, []QuotaHistorySample{a, b, c, b, d}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mergeQuotaHistorySamples(tc.older, tc.newer); !slices.Equal(got, tc.want) {
+				t.Fatalf("merged=%+v want=%+v", got, tc.want)
+			}
+		})
 	}
 }
