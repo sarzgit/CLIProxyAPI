@@ -982,7 +982,13 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 func selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
 	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
 	if !isBuiltInSelector(selector) {
-		if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
+		switch selector.(type) {
+		case *SessionAffinitySelector, *SoonestResetFirstSelector:
+			// The manager already validated these candidates against the resolved
+			// upstream model. SoonestResetFirstSelector is kept out of
+			// isBuiltInSelector so scheduler fast paths, which do not rank by
+			// reset time, never replace it.
+		default:
 			return ctx
 		}
 	}

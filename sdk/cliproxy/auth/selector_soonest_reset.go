@@ -11,19 +11,33 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
+// unknownResetProbeInterval bounds how often a credential with no known reset is
+// tried ahead of credentials whose resets are known. One response is normally
+// enough to learn a window; a credential that never reports one must not keep
+// taking new sessions from credentials whose quota is about to expire.
+const unknownResetProbeInterval = 10 * time.Minute
+
+const maxSoonestResetSelectorKeys = 4096
+
 // SoonestResetFirstSelector prefers the available credential whose longest quota
 // window (the weekly window on Claude and Codex subscriptions) resets soonest.
-// Quota left in a window when it resets is lost, so draining the account that
+// Quota left in a window when it resets is lost, so draining the credential that
 // resets first wastes the least.
 //
 // Reset times come from the quota signals recorded on each credential's most
-// recent upstream response. A credential with no known future reset sorts first
-// so one request can observe its window. Credentials whose resets fall in the
-// same minute rotate in round-robin order. Availability, cooldowns, disabled
-// credentials and priority tiers are handled exactly like the other selectors.
+// recent upstream response. Ranking, from first to last:
+//  1. credentials with no known future reset that were not probed within
+//     unknownResetProbeInterval, so one request can observe their window;
+//  2. credentials with a known future reset, soonest first;
+//  3. credentials with no known reset that were probed recently.
+//
+// Credentials in the same rank (and, for known resets, the same minute) rotate in
+// round-robin order. Availability, cooldowns, disabled credentials, priority tiers
+// and Codex websocket preference are handled like the other selectors.
 type SoonestResetFirstSelector struct {
 	mu         sync.Mutex
 	lastPicked map[string]string
+	probedAt   map[string]time.Time
 	nowFunc    func() time.Time
 }
 
@@ -35,22 +49,26 @@ func (s *SoonestResetFirstSelector) Pick(ctx context.Context, provider, model st
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = preferCodexWebsocketAuths(ctx, websocketPreferenceProvider(provider, available), available)
 	if len(available) == 1 {
 		return available[0], nil
 	}
 
-	// available is ID-sorted, and filtering keeps that order, which successorIndex needs.
-	soonest := soonestResetAuths(available, now)
-
-	key := provider + ":" + canonicalModelLookupKey(model)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.lastPicked == nil || (len(s.lastPicked) >= 4096 && s.lastPicked[key] == "") {
+
+	// available is ID-sorted, and ranking keeps that order, which successorIndex needs.
+	candidates, probing := s.soonestResetAuthsLocked(available, now)
+
+	key := provider + ":" + canonicalModelLookupKey(model)
+	if s.lastPicked == nil || (len(s.lastPicked) >= maxSoonestResetSelectorKeys && s.lastPicked[key] == "") {
 		s.lastPicked = make(map[string]string)
 	}
-	picked := soonest[successorIndex(soonest, s.lastPicked[key])]
+	picked := candidates[successorIndex(candidates, s.lastPicked[key])]
 	s.lastPicked[key] = picked.ID
+	if probing {
+		s.recordProbeLocked(picked.ID, now)
+	}
 	return picked, nil
 }
 
@@ -61,33 +79,76 @@ func (s *SoonestResetFirstSelector) now() time.Time {
 	return time.Now()
 }
 
-// soonestResetAuths returns the candidates that share the earliest reset minute,
-// preserving input order. Unknown resets rank before every known reset.
-func soonestResetAuths(auths []*Auth, now time.Time) []*Auth {
-	var best []*Auth
-	var bestReset time.Time
-	bestKnown := true
+// soonestResetAuthsLocked returns the best-ranked candidates in input order and
+// whether they are unknown credentials being probed. Must be called with s.mu held.
+func (s *SoonestResetFirstSelector) soonestResetAuthsLocked(auths []*Auth, now time.Time) ([]*Auth, bool) {
+	var probe, known, recentlyProbed []*Auth
+	var soonest time.Time
 	for _, auth := range auths {
-		reset, known := quotaWindowResetAt(auth, now)
-		if known {
-			reset = reset.Truncate(time.Minute)
+		reset, ok := quotaWindowResetAt(auth, now)
+		if !ok {
+			if last, probed := s.probedAt[auth.ID]; probed && now.Sub(last) < unknownResetProbeInterval {
+				recentlyProbed = append(recentlyProbed, auth)
+			} else {
+				probe = append(probe, auth)
+			}
+			continue
 		}
+		reset = reset.Truncate(time.Minute)
 		switch {
-		case best == nil,
-			!known && bestKnown,
-			known && bestKnown && reset.Before(bestReset):
-			best = []*Auth{auth}
-			bestReset = reset
-			bestKnown = known
-		case known == bestKnown && (!known || reset.Equal(bestReset)):
-			best = append(best, auth)
+		case known == nil || reset.Before(soonest):
+			known = []*Auth{auth}
+			soonest = reset
+		case reset.Equal(soonest):
+			known = append(known, auth)
 		}
 	}
-	return best
+	switch {
+	case len(probe) > 0:
+		return probe, true
+	case len(known) > 0:
+		return known, false
+	default:
+		return recentlyProbed, false
+	}
+}
+
+// recordProbeLocked notes that an unknown credential was handed a request.
+// Must be called with s.mu held.
+func (s *SoonestResetFirstSelector) recordProbeLocked(authID string, now time.Time) {
+	if s.probedAt == nil {
+		s.probedAt = make(map[string]time.Time)
+	}
+	if len(s.probedAt) >= maxSoonestResetSelectorKeys {
+		for id, last := range s.probedAt {
+			if now.Sub(last) >= unknownResetProbeInterval {
+				delete(s.probedAt, id)
+			}
+		}
+		if len(s.probedAt) >= maxSoonestResetSelectorKeys {
+			s.probedAt = make(map[string]time.Time)
+		}
+	}
+	s.probedAt[authID] = now
+}
+
+// websocketPreferenceProvider returns "codex" when a mixed-provider selection only
+// contains Codex credentials, so Codex websocket preference still applies.
+func websocketPreferenceProvider(provider string, auths []*Auth) string {
+	if !strings.EqualFold(strings.TrimSpace(provider), "mixed") || len(auths) == 0 {
+		return provider
+	}
+	for _, auth := range auths {
+		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			return provider
+		}
+	}
+	return "codex"
 }
 
 // quotaWindowResetAt reports when the credential's longest observed quota window
-// resets. It returns false when no reset in the future is known.
+// resets. It returns false when that reset is missing, unparseable or not in the
+// future; a shorter window is never substituted for the longest one.
 func quotaWindowResetAt(auth *Auth, now time.Time) (time.Time, bool) {
 	if auth == nil || len(auth.Quota.Signals) == 0 {
 		return time.Time{}, false
@@ -95,34 +156,32 @@ func quotaWindowResetAt(auth *Auth, now time.Time) (time.Time, bool) {
 	signals := auth.Quota.Signals
 
 	// Claude: the shared 7-day window.
-	if reset, ok := parseResetTimestamp(quotaSignal(signals, "Anthropic-Ratelimit-Unified-7d-Reset")); ok && reset.After(now) {
-		return reset, true
+	if raw := quotaSignal(signals, "Anthropic-Ratelimit-Unified-7d-Reset"); raw != "" {
+		reset, ok := parseResetTimestamp(raw)
+		return reset, ok && reset.After(now)
 	}
 
-	// Codex: the primary and secondary windows; the longer one is the weekly window.
-	var longest time.Time
-	longestMinutes := int64(-1)
+	// Codex: the longer of the primary and secondary windows is the weekly window.
+	longestPrefix := ""
+	longestMinutes := int64(0)
 	for _, prefix := range []string{"X-Codex-Primary-", "X-Codex-Secondary-"} {
 		minutes, errMinutes := strconv.ParseInt(quotaSignal(signals, prefix+"Window-Minutes"), 10, 64)
-		if errMinutes != nil || minutes <= 0 || minutes <= longestMinutes {
-			continue
-		}
-		reset, ok := parseResetTimestamp(quotaSignal(signals, prefix+"Reset-At"))
-		if !ok && !auth.Quota.ObservedAt.IsZero() {
-			if seconds, errSeconds := strconv.ParseFloat(quotaSignal(signals, prefix+"Reset-After-Seconds"), 64); errSeconds == nil && seconds >= 0 {
-				reset = auth.Quota.ObservedAt.Add(time.Duration(seconds * float64(time.Second)))
-				ok = true
-			}
-		}
-		if ok && reset.After(now) {
-			longest = reset
+		if errMinutes == nil && minutes > longestMinutes {
+			longestPrefix = prefix
 			longestMinutes = minutes
 		}
 	}
-	if longestMinutes > 0 {
-		return longest, true
+	if longestPrefix == "" {
+		return time.Time{}, false
 	}
-	return time.Time{}, false
+	reset, ok := parseResetTimestamp(quotaSignal(signals, longestPrefix+"Reset-At"))
+	if !ok && !auth.Quota.ObservedAt.IsZero() {
+		if seconds, errSeconds := strconv.ParseFloat(quotaSignal(signals, longestPrefix+"Reset-After-Seconds"), 64); errSeconds == nil && seconds >= 0 {
+			reset = auth.Quota.ObservedAt.Add(time.Duration(seconds * float64(time.Second)))
+			ok = true
+		}
+	}
+	return reset, ok && reset.After(now)
 }
 
 // quotaSignal looks up a recorded quota header regardless of its stored casing.

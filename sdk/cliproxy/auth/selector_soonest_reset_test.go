@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -233,5 +235,107 @@ func TestSoonestResetFirstSelector_SessionAffinityKeepsBoundAccount(t *testing.T
 	}
 	if got := pick("session-two"); got != "a" {
 		t.Fatalf("new session picked %q, want a (now resets soonest)", got)
+	}
+}
+
+func TestSoonestResetFirstSelector_BoundsUnknownProbing(t *testing.T) {
+	t.Parallel()
+
+	now := soonestResetTestNow
+	selector := &SoonestResetFirstSelector{nowFunc: func() time.Time { return now }}
+	// "silent" never reports a reset, so it stays unknown after every request.
+	auths := []*Auth{claudeAuthResettingIn("known", 2*time.Hour), {ID: "silent"}}
+	auths[0].Quota.Signals["Anthropic-Ratelimit-Unified-7d-Reset"] = strconv.FormatInt(now.Add(2*time.Hour).Unix(), 10)
+
+	want := []string{"silent", "known", "known", "known"}
+	for i, id := range want {
+		if got := pickSoonest(t, selector, "", auths); got != id {
+			t.Fatalf("pick %d = %q, want %q", i, got, id)
+		}
+	}
+	now = now.Add(unknownResetProbeInterval)
+	if got := pickSoonest(t, selector, "", auths); got != "silent" {
+		t.Fatalf("after probe interval picked %q, want silent probed again", got)
+	}
+	if got := pickSoonest(t, selector, "", auths); got != "known" {
+		t.Fatalf("after re-probe picked %q, want known", got)
+	}
+}
+
+func TestSoonestResetFirstSelector_AllUnknownStillRotates(t *testing.T) {
+	t.Parallel()
+
+	selector := newSoonestResetTestSelector()
+	auths := []*Auth{{ID: "a"}, {ID: "b"}}
+	want := []string{"a", "b", "a", "b"}
+	for i, id := range want {
+		if got := pickSoonest(t, selector, "", auths); got != id {
+			t.Fatalf("pick %d = %q, want %q", i, got, id)
+		}
+	}
+}
+
+func TestQuotaWindowResetAt_ExpiredLongestWindowIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	auth := &Auth{ID: "codex", Quota: QuotaState{ObservedAt: soonestResetTestNow, Signals: map[string]string{
+		"X-Codex-Primary-Window-Minutes":   "300",
+		"X-Codex-Primary-Reset-At":         strconv.FormatInt(soonestResetTestNow.Add(2*time.Hour).Unix(), 10),
+		"X-Codex-Secondary-Window-Minutes": "10080",
+		"X-Codex-Secondary-Reset-At":       strconv.FormatInt(soonestResetTestNow.Add(-time.Hour).Unix(), 10),
+	}}}
+	if reset, ok := quotaWindowResetAt(auth, soonestResetTestNow); ok {
+		t.Fatalf("quotaWindowResetAt() = %v, true; want unknown instead of the 5h window", reset)
+	}
+}
+
+func TestSoonestResetFirstSelector_MixedCodexOnlyKeepsWebsocketPreference(t *testing.T) {
+	t.Parallel()
+
+	httpAuth := &Auth{ID: "a-http", Provider: "codex", Quota: QuotaState{Signals: map[string]string{
+		"X-Codex-Secondary-Window-Minutes": "10080",
+		"X-Codex-Secondary-Reset-At":       strconv.FormatInt(soonestResetTestNow.Add(time.Hour).Unix(), 10),
+	}}}
+	wsAuth := &Auth{ID: "b-ws", Provider: "codex", Attributes: map[string]string{"websockets": "true"}, Quota: QuotaState{Signals: map[string]string{
+		"X-Codex-Secondary-Window-Minutes": "10080",
+		"X-Codex-Secondary-Reset-At":       strconv.FormatInt(soonestResetTestNow.Add(48*time.Hour).Unix(), 10),
+	}}}
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, err := newSoonestResetTestSelector().Pick(ctx, "mixed", "", cliproxyexecutor.Options{}, []*Auth{httpAuth, wsAuth})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got.ID != "b-ws" {
+		t.Fatalf("Pick() = %q, want b-ws (websocket preference applies before reset order)", got.ID)
+	}
+}
+
+func TestSoonestResetFirstSelector_ManagerIgnoresStaleAliasCooldown(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+
+	ctx := context.Background()
+	const routeModel, targetModel = "srf-alias", "srf-target"
+	manager := NewManager(nil, &SoonestResetFirstSelector{}, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	manager.RegisterExecutor(schedulerTestExecutor{provider: "codex"})
+	retryAfter := time.Hour
+	for _, id := range []string{"srf-a-" + t.Name(), "srf-b-" + t.Name()} {
+		registry.GetGlobalRegistry().RegisterClient(id, "codex", []*registry.ModelInfo{{ID: routeModel}, {ID: targetModel}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+		if _, errRegister := manager.Register(ctx, &Auth{ID: id, Provider: "codex", Status: StatusActive}); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+		// Cooldown recorded under the alias name before the alias pointed elsewhere.
+		manager.MarkResult(ctx, Result{
+			AuthID: id, Provider: "codex", Model: routeModel, RetryAfter: &retryAfter,
+			Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "model quota"},
+		})
+	}
+	manager.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{
+		"codex": {{Name: targetModel, Alias: routeModel, Fork: true}},
+	})
+
+	if _, errSelect := manager.SelectAuth(ctx, "codex", routeModel, cliproxyexecutor.Options{Metadata: map[string]any{}}); errSelect != nil {
+		t.Fatalf("SelectAuth() error = %v, want a healthy credential for the resolved target model", errSelect)
 	}
 }
