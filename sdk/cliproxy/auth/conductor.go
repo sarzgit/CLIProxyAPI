@@ -206,6 +206,8 @@ type Manager struct {
 	providerOffsets             map[string]int
 	homeDispatchBundle          atomic.Pointer[HomeDispatchBundle]
 	homeInFlightPublisherConfig atomic.Pointer[HomeInFlightPublisherConfig]
+	// quotaHistory records weekly quota samples from passive observations.
+	quotaHistory atomic.Pointer[QuotaHistoryRecorder]
 
 	// Retry controls request retry behavior.
 	requestRetry        atomic.Int32

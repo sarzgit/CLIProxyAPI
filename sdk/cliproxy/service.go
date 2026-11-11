@@ -104,6 +104,9 @@ type Service struct {
 	// coreManager handles core authentication and execution.
 	coreManager *coreauth.Manager
 
+	// quotaHistory records weekly quota samples beside the config file.
+	quotaHistory *coreauth.QuotaHistoryRecorder
+
 	// cooldownStateStore persists runtime cooldown state when enabled.
 	cooldownStateStore coreauth.CooldownStateStore
 

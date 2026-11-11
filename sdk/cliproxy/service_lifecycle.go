@@ -92,6 +92,7 @@ func (s *Service) Run(ctx context.Context) error {
 			log.Warnf("failed to load auth store: %v", errLoad)
 		}
 		s.registerConfigAPIKeyAuths(coreauth.WithSkipPersist(ctx), cfg)
+		s.startQuotaHistory(ctx)
 		if cfg != nil && cfg.SaveCooldownStatus {
 			if errRestoreCooldown := s.coreManager.RestoreCooldownStates(ctx); errRestoreCooldown != nil {
 				log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
@@ -374,6 +375,15 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
+		if s.quotaHistory != nil {
+			if s.coreManager != nil {
+				s.coreManager.SetQuotaHistoryRecorder(nil)
+			}
+			if errCloseHistory := s.quotaHistory.Close(); errCloseHistory != nil {
+				log.WithError(errCloseHistory).Warn("failed to persist quota history during shutdown")
+			}
+		}
+
 		if s.pluginHost != nil {
 			sdktranslator.SetPluginHooks(nil)
 			sdkAuth.RegisterPluginAuthParser(nil)
@@ -403,6 +413,21 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		usage.StopDefault()
 	})
 	return shutdownErr
+}
+
+// startQuotaHistory loads quota history stored beside the config file and
+// starts recording. A missing config path keeps history in memory only.
+func (s *Service) startQuotaHistory(ctx context.Context) {
+	if s.coreManager == nil || s.quotaHistory != nil {
+		return
+	}
+	recorder := coreauth.NewQuotaHistoryRecorder(coreauth.QuotaHistoryPathForConfig(s.configPath))
+	if errLoad := recorder.Load(); errLoad != nil {
+		log.WithError(errLoad).Warn("failed to load quota history; starting empty")
+	}
+	recorder.Start(ctx)
+	s.quotaHistory = recorder
+	s.coreManager.SetQuotaHistoryRecorder(recorder)
 }
 
 func (s *Service) ensureAuthDir() error {
