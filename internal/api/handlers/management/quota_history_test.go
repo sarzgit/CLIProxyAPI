@@ -52,6 +52,8 @@ func TestGetQuotaHistoryResponseShape(t *testing.T) {
 		}},
 	})
 
+	recorder.Drain()
+
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
 	since := now.Add(-90 * time.Minute).Unix()
 	rec := httptest.NewRecorder()

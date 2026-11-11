@@ -423,7 +423,7 @@ func (s *Service) startQuotaHistory(ctx context.Context) {
 	}
 	recorder := coreauth.NewQuotaHistoryRecorder(coreauth.QuotaHistoryPathForConfig(s.configPath))
 	if errLoad := recorder.Load(); errLoad != nil {
-		log.WithError(errLoad).Warn("failed to load quota history; starting empty")
+		log.WithError(errLoad).Warn("failed to load quota history; persistence paused until recovery")
 	}
 	recorder.Start(ctx)
 	s.quotaHistory = recorder

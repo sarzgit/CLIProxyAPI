@@ -1,10 +1,15 @@
 package auth
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,7 +40,8 @@ func TestQuotaHistorySampleClaude(t *testing.T) {
 		wantRemaining float64
 	}{
 		{"fraction", "0.52", 48},
-		{"percent", "37.5", 62.5},
+		{"over fraction", "1.05", 0},
+		{"large fraction", "37.5", 0},
 		{"over", "150", 0},
 		{"negative", "-0.2", 100},
 	} {
@@ -131,6 +137,7 @@ func TestQuotaHistoryRecordThresholds(t *testing.T) {
 	observe(8*time.Minute, "0.10", "1795100000")     // older than last: skipped
 	observe(9*time.Minute+time.Second, "0.506", "0") // reset became unknown: recorded
 
+	recorder.Drain()
 	entry := recorder.History(time.Unix(0, 0))["claude-a.json"]
 	gotTimes := make([]int64, 0, len(entry.Samples))
 	for _, sample := range entry.Samples {
@@ -311,6 +318,7 @@ func TestManagerMarkResultFeedsQuotaHistory(t *testing.T) {
 	})
 	manager.MarkResult(ctx, Result{AuthID: auth.ID, Provider: "codex", Model: "gpt-5.3-codex", Success: true})
 
+	recorder.Drain()
 	samples := recorder.History(time.Unix(0, 0))[auth.ID].Samples
 	if len(samples) != 1 || samples[0].RemainingPercent != 70 || samples[0].ResetAt != 1_782_951_970 {
 		t.Fatalf("recorded samples=%+v", samples)
@@ -318,7 +326,368 @@ func TestManagerMarkResultFeedsQuotaHistory(t *testing.T) {
 
 	// A result without quota headers records nothing new.
 	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "codex", Model: "gpt-5.3-codex", Success: true})
+	recorder.Drain()
 	if got := recorder.History(time.Unix(0, 0))[auth.ID].Samples; len(got) != 1 {
 		t.Fatalf("samples after header-less result=%+v", got)
+	}
+}
+
+func TestQuotaHistoryCodexWeeklyWindowBoundary(t *testing.T) {
+	now := time.Unix(1_794_390_000, 0)
+	for _, tc := range []struct {
+		minutes string
+		want    bool
+	}{
+		{"300", false}, {"1440", false}, {"10019", false},
+		{"10020", true}, {"10080", true}, {"20160", true},
+	} {
+		t.Run(tc.minutes, func(t *testing.T) {
+			_, _, ok := quotaHistorySampleFromAuth(quotaHistoryAuth("codex", "codex", now, map[string]string{
+				"X-Codex-Primary-Window-Minutes": tc.minutes,
+				"X-Codex-Primary-Used-Percent":   "90",
+			}))
+			if ok != tc.want {
+				t.Fatalf("window=%s recorded=%v, want %v", tc.minutes, ok, tc.want)
+			}
+		})
+	}
+	// The primary window can also be the weekly one.
+	sample, minutes, ok := quotaHistorySampleFromAuth(quotaHistoryAuth("codex", "codex", now, map[string]string{
+		"X-Codex-Primary-Window-Minutes":   "10080",
+		"X-Codex-Primary-Used-Percent":     "25",
+		"X-Codex-Secondary-Window-Minutes": "300",
+		"X-Codex-Secondary-Used-Percent":   "90",
+	}))
+	if !ok || minutes != 10080 || sample.RemainingPercent != 75 {
+		t.Fatalf("weekly primary sample=%+v minutes=%d ok=%v", sample, minutes, ok)
+	}
+}
+
+func readPersistedQuotaHistory(t *testing.T, path string) quotaHistoryFile {
+	t.Helper()
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	file, errDecode := decodeQuotaHistoryFile(data)
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	return file
+}
+
+func TestQuotaHistoryPruningPersistsWithoutNewObservations(t *testing.T) {
+	now := time.Unix(1_794_390_000, 0)
+	for _, onLoad := range []bool{false, true} {
+		t.Run(fmt.Sprintf("load=%v", onLoad), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), QuotaHistoryFileName)
+			r := newTestQuotaHistoryRecorder(path, &now)
+			r.Observe(quotaHistoryAuth("old", "claude", now, map[string]string{
+				"Anthropic-Ratelimit-Unified-7d-Utilization": "0.5",
+			}))
+			if errFlush := r.Flush(); errFlush != nil {
+				t.Fatal(errFlush)
+			}
+			later := now.Add(quotaHistoryRetention + time.Second)
+			if onLoad {
+				r = newTestQuotaHistoryRecorder(path, &later)
+				if errLoad := r.Load(); errLoad != nil {
+					t.Fatal(errLoad)
+				}
+			} else {
+				r.nowFunc = func() time.Time { return later }
+			}
+			if errFlush := r.Flush(); errFlush != nil {
+				t.Fatal(errFlush)
+			}
+			// Inspect the raw persisted data, not History's retention filter.
+			if file := readPersistedQuotaHistory(t, path); len(file.Accounts) != 0 {
+				t.Fatalf("expired samples remain on disk: %+v", file.Accounts)
+			}
+		})
+	}
+}
+
+func TestQuotaHistoryUnreadableFileBlocksReplacement(t *testing.T) {
+	now := time.Unix(1_794_390_000, 0)
+	path := filepath.Join(t.TempDir(), QuotaHistoryFileName)
+	original := []byte(`{"version":1,"accounts":{"old":{"provider":"claude","samples":[{"t":1794390000,"remaining_percent":50}]}}}`)
+	if errWrite := os.WriteFile(path, original, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if errChmod := os.Chmod(path, 0); errChmod != nil {
+		t.Fatal(errChmod)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+	if _, errRead := os.ReadFile(path); errRead == nil {
+		t.Skip("process can read mode-000 files")
+	}
+	r := newTestQuotaHistoryRecorder(path, &now)
+	if errLoad := r.Load(); errLoad == nil {
+		t.Fatal("expected unreadable history error")
+	}
+	r.Observe(quotaHistoryAuth("new", "claude", now, map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.2",
+	}))
+	if errFlush := r.Flush(); !errors.Is(errFlush, errQuotaHistoryWriteBlocked) {
+		t.Fatalf("Flush()=%v, want blocked", errFlush)
+	}
+	if errChmod := os.Chmod(path, 0o600); errChmod != nil {
+		t.Fatal(errChmod)
+	}
+	got, errRead := os.ReadFile(path)
+	if errRead != nil || !bytes.Equal(got, original) {
+		t.Fatalf("unreadable history replaced: data=%s err=%v", got, errRead)
+	}
+	if errFlush := r.Close(); errFlush != nil {
+		t.Fatal(errFlush)
+	}
+	if file := readPersistedQuotaHistory(t, path); len(file.Accounts) != 2 {
+		t.Fatalf("recovery lost stored or pending history: %+v", file.Accounts)
+	}
+}
+
+func TestQuotaHistoryRecoveryMergesPendingSamples(t *testing.T) {
+	now := time.Unix(1_794_390_000, 0)
+	path := filepath.Join(t.TempDir(), QuotaHistoryFileName)
+	// A directory guarantees a read failure even when tests run as root.
+	if errMkdir := os.Mkdir(path, 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	r := newTestQuotaHistoryRecorder(path, &now)
+	if errLoad := r.Load(); errLoad == nil {
+		t.Fatal("expected load error")
+	}
+	r.Observe(quotaHistoryAuth("same", "claude", now, map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.2",
+	}))
+	if errFlush := r.Flush(); !errors.Is(errFlush, errQuotaHistoryWriteBlocked) {
+		t.Fatalf("Flush()=%v, want blocked", errFlush)
+	}
+	if errRemove := os.Remove(path); errRemove != nil {
+		t.Fatal(errRemove)
+	}
+	if errWrite := writeQuotaHistoryFile(path, quotaHistoryFile{Version: 1, Accounts: map[string]*QuotaHistoryEntry{
+		"same": {Provider: "claude", Samples: []QuotaHistorySample{
+			{T: now.Add(-time.Hour).Unix(), RemainingPercent: 90},
+			{T: now.Unix(), RemainingPercent: 30},
+		}},
+		"other": {Provider: "codex", Samples: []QuotaHistorySample{{T: now.Unix(), RemainingPercent: 40}}},
+	}}); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if errFlush := r.Flush(); errFlush != nil {
+		t.Fatal(errFlush)
+	}
+	file := readPersistedQuotaHistory(t, path)
+	samples := file.Accounts["same"].Samples
+	if len(file.Accounts) != 2 || len(samples) != 2 || samples[0].RemainingPercent != 90 || samples[1].RemainingPercent != 80 {
+		t.Fatalf("recovered file=%+v same samples=%+v", file.Accounts, samples)
+	}
+}
+
+func TestQuotaHistoryCorruptBackupsArePreserved(t *testing.T) {
+	now := time.Unix(1_794_390_000, 0)
+	path := filepath.Join(t.TempDir(), QuotaHistoryFileName)
+	for _, corrupt := range []string{"{broken one", `{"accounts":{"a":{"samples":"wrong type"}}}`} {
+		if errWrite := os.WriteFile(path, []byte(corrupt), 0o600); errWrite != nil {
+			t.Fatal(errWrite)
+		}
+		r := newTestQuotaHistoryRecorder(path, &now)
+		if errLoad := r.Load(); errLoad != nil {
+			t.Fatal(errLoad)
+		}
+		if _, errStat := os.Stat(path); !os.IsNotExist(errStat) {
+			t.Fatalf("corrupt source not moved: %v", errStat)
+		}
+	}
+	backups, errGlob := filepath.Glob(path + ".corrupt-*")
+	if errGlob != nil || len(backups) != 2 {
+		t.Fatalf("backups=%v err=%v", backups, errGlob)
+	}
+	contents := make(map[string]bool)
+	for _, backup := range backups {
+		data, errRead := os.ReadFile(backup)
+		if errRead != nil {
+			t.Fatal(errRead)
+		}
+		contents[string(data)] = true
+	}
+	if !contents["{broken one"] || !contents[`{"accounts":{"a":{"samples":"wrong type"}}}`] {
+		t.Fatalf("corrupt originals lost: %v", contents)
+	}
+}
+
+func TestQuotaHistoryObserveNeverWaitsForHistoryLocks(t *testing.T) {
+	r := NewQuotaHistoryRecorder("")
+	auth := quotaHistoryAuth("queued", "claude", time.Now(), map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.25",
+	})
+	r.mu.Lock()
+	r.writeMu.Lock()
+	r.drainMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < quotaHistoryQueueSize+10; i++ {
+			r.Observe(auth)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Error("Observe blocked behind history work")
+	}
+	r.drainMu.Unlock()
+	r.writeMu.Unlock()
+	r.mu.Unlock()
+	<-done
+	if len(r.queue) != quotaHistoryQueueSize || r.Dropped() != 10 {
+		t.Fatalf("queued=%d dropped=%d", len(r.queue), r.Dropped())
+	}
+	// Queue values must not retain mutable auth state.
+	auth.Quota.Signals["Anthropic-Ratelimit-Unified-7d-Utilization"] = "0.9"
+	r.Drain()
+	if got := r.History(time.Unix(0, 0))["queued"].Samples; len(got) != 1 || got[0].RemainingPercent != 75 {
+		t.Fatalf("queued sample changed with source auth: %+v", got)
+	}
+}
+
+func TestQuotaHistoryCloseDrainsAndStopsAdmission(t *testing.T) {
+	for _, start := range []bool{false, true} {
+		t.Run(fmt.Sprintf("start=%v", start), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), QuotaHistoryFileName)
+			r := NewQuotaHistoryRecorder(path)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if start {
+				r.Start(ctx)
+			}
+			now := time.Now().Add(-time.Hour)
+			for i := 0; i < 100; i++ {
+				r.Observe(quotaHistoryAuth("a", "claude", now.Add(time.Duration(i)*time.Second), map[string]string{
+					"Anthropic-Ratelimit-Unified-7d-Utilization": strconv.FormatFloat(float64(i)/100, 'f', 2, 64),
+				}))
+			}
+			// Service cancellation can precede server stop and final recorder close.
+			cancel()
+			if errClose := r.Close(); errClose != nil {
+				t.Fatal(errClose)
+			}
+			if got := readPersistedQuotaHistory(t, path).Accounts["a"].Samples; len(got) != 100 {
+				t.Fatalf("shutdown lost queued samples: %d", len(got))
+			}
+			r.Observe(quotaHistoryAuth("late", "claude", time.Now(), map[string]string{
+				"Anthropic-Ratelimit-Unified-7d-Utilization": "0.5",
+			}))
+			r.Start(context.Background())
+			if errClose := r.Close(); errClose != nil {
+				t.Fatal(errClose)
+			}
+			if len(r.queue) != 0 || r.loopDone != nil && !isQuotaHistoryDone(r.loopDone) {
+				t.Fatal("closed recorder accepted work or restarted")
+			}
+		})
+	}
+}
+
+func isQuotaHistoryDone(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
+func TestQuotaHistoryConcurrentOperations(t *testing.T) {
+	r := NewQuotaHistoryRecorder(filepath.Join(t.TempDir(), QuotaHistoryFileName))
+	r.Start(context.Background())
+	var workers sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		workers.Go(func() {
+			for j := 0; j < 50; j++ {
+				switch i {
+				case 0, 1:
+					r.Observe(quotaHistoryAuth("a", "claude", time.Now(), map[string]string{
+						"Anthropic-Ratelimit-Unified-7d-Utilization": "0.5",
+					}))
+				case 2:
+					r.History(time.Unix(0, 0))
+				case 3:
+					r.Drain()
+				case 4:
+					if errFlush := r.Flush(); errFlush != nil {
+						t.Error(errFlush)
+					}
+				case 5:
+					if errLoad := r.Load(); errLoad != nil {
+						t.Error(errLoad)
+					}
+				}
+			}
+		})
+	}
+	workers.Wait()
+	for i := 0; i < 3; i++ {
+		workers.Go(func() {
+			if errClose := r.Close(); errClose != nil {
+				t.Error(errClose)
+			}
+		})
+	}
+	workers.Wait()
+	if got := readPersistedQuotaHistory(t, r.path).Accounts["a"].Samples; len(got) != 1 {
+		t.Fatalf("concurrent operations lost sample: %+v", got)
+	}
+}
+
+func TestQuotaHistoryObserveDoesNotWaitForShutdownGate(t *testing.T) {
+	r := NewQuotaHistoryRecorder("")
+	r.admissionMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Observe(quotaHistoryAuth("late", "claude", time.Now(), map[string]string{
+			"Anthropic-Ratelimit-Unified-7d-Utilization": "0.5",
+		}))
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Error("Observe waited for shutdown gate")
+	}
+	r.admissionMu.Unlock()
+	<-done
+	if len(r.queue) != 0 || r.Dropped() != 1 {
+		t.Fatalf("queued=%d dropped=%d", len(r.queue), r.Dropped())
+	}
+}
+
+func TestQuotaHistoryCloseWithConcurrentProducer(t *testing.T) {
+	r := NewQuotaHistoryRecorder(filepath.Join(t.TempDir(), QuotaHistoryFileName))
+	r.Start(context.Background())
+	started, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			r.Observe(quotaHistoryAuth(strconv.Itoa(i), "claude", time.Now(), map[string]string{
+				"Anthropic-Ratelimit-Unified-7d-Utilization": "0.5",
+			}))
+			if i == 0 {
+				close(started)
+			}
+		}
+	}()
+	<-started
+	if errClose := r.Close(); errClose != nil {
+		t.Fatal(errClose)
+	}
+	<-done
+	if len(r.queue) != 0 {
+		t.Fatal("late producer queued observations after final drain")
+	}
+	if file := readPersistedQuotaHistory(t, r.path); file.Accounts["0"] == nil {
+		t.Fatal("shutdown lost an accepted observation")
 	}
 }
