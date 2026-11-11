@@ -39,6 +39,8 @@ type SoonestResetFirstSelector struct {
 	lastPicked map[string]string
 	probedAt   map[string]time.Time
 	nowFunc    func() time.Time
+	// maxProbes caps probe records; zero means maxSoonestResetSelectorKeys.
+	maxProbes int
 }
 
 // Pick selects the available auth whose quota window resets soonest.
@@ -82,12 +84,16 @@ func (s *SoonestResetFirstSelector) now() time.Time {
 // soonestResetAuthsLocked returns the best-ranked candidates in input order and
 // whether they are unknown credentials being probed. Must be called with s.mu held.
 func (s *SoonestResetFirstSelector) soonestResetAuthsLocked(auths []*Auth, now time.Time) ([]*Auth, bool) {
+	// With probe storage full, unprobed credentials wait like recently probed ones
+	// until records expire. Clearing history instead would restart probing for
+	// every unknown credential and starve known resets.
+	canProbe := s.pruneProbesLocked(now)
 	var probe, known, recentlyProbed []*Auth
 	var soonest time.Time
 	for _, auth := range auths {
 		reset, ok := quotaWindowResetAt(auth, now)
 		if !ok {
-			if last, probed := s.probedAt[auth.ID]; probed && now.Sub(last) < unknownResetProbeInterval {
+			if last, probed := s.probedAt[auth.ID]; !canProbe || (probed && now.Sub(last) < unknownResetProbeInterval) {
 				recentlyProbed = append(recentlyProbed, auth)
 			} else {
 				probe = append(probe, auth)
@@ -113,21 +119,29 @@ func (s *SoonestResetFirstSelector) soonestResetAuthsLocked(auths []*Auth, now t
 	}
 }
 
+// pruneProbesLocked drops expired probe records once storage is full and reports
+// whether another probe can be recorded. Must be called with s.mu held.
+func (s *SoonestResetFirstSelector) pruneProbesLocked(now time.Time) bool {
+	limit := s.maxProbes
+	if limit <= 0 {
+		limit = maxSoonestResetSelectorKeys
+	}
+	if len(s.probedAt) < limit {
+		return true
+	}
+	for id, last := range s.probedAt {
+		if now.Sub(last) >= unknownResetProbeInterval {
+			delete(s.probedAt, id)
+		}
+	}
+	return len(s.probedAt) < limit
+}
+
 // recordProbeLocked notes that an unknown credential was handed a request.
-// Must be called with s.mu held.
+// Callers only record after pruneProbesLocked reported room. Must be called with s.mu held.
 func (s *SoonestResetFirstSelector) recordProbeLocked(authID string, now time.Time) {
 	if s.probedAt == nil {
 		s.probedAt = make(map[string]time.Time)
-	}
-	if len(s.probedAt) >= maxSoonestResetSelectorKeys {
-		for id, last := range s.probedAt {
-			if now.Sub(last) >= unknownResetProbeInterval {
-				delete(s.probedAt, id)
-			}
-		}
-		if len(s.probedAt) >= maxSoonestResetSelectorKeys {
-			s.probedAt = make(map[string]time.Time)
-		}
 	}
 	s.probedAt[authID] = now
 }

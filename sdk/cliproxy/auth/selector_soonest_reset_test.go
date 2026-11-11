@@ -339,3 +339,30 @@ func TestSoonestResetFirstSelector_ManagerIgnoresStaleAliasCooldown(t *testing.T
 		t.Fatalf("SelectAuth() error = %v, want a healthy credential for the resolved target model", errSelect)
 	}
 }
+
+func TestSoonestResetFirstSelector_FullProbeStorageDoesNotRestartProbing(t *testing.T) {
+	t.Parallel()
+
+	now := soonestResetTestNow
+	selector := &SoonestResetFirstSelector{nowFunc: func() time.Time { return now }, maxProbes: 2}
+	auths := []*Auth{
+		claudeAuthResettingIn("known", 2*time.Hour),
+		{ID: "unknown-1"}, {ID: "unknown-2"}, {ID: "unknown-3"},
+	}
+
+	// Two probes fill storage; the third unknown credential must then wait behind known.
+	want := []string{"unknown-1", "unknown-2", "known", "known", "known"}
+	for i, id := range want {
+		if got := pickSoonest(t, selector, "", auths); got != id {
+			t.Fatalf("pick %d = %q, want %q", i, got, id)
+		}
+	}
+	if len(selector.probedAt) != 2 {
+		t.Fatalf("probe records = %d, want 2 (history must not be cleared)", len(selector.probedAt))
+	}
+	// Once records expire, probing resumes.
+	now = now.Add(unknownResetProbeInterval)
+	if got := pickSoonest(t, selector, "", auths); got != "unknown-3" && got != "unknown-1" {
+		t.Fatalf("after expiry picked %q, want an unknown credential probed", got)
+	}
+}
